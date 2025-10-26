@@ -7,6 +7,7 @@ require (
 	github.com/go-ini/ini v1.67.0
 	github.com/godbus/dbus/v5 v5.1.0
 	github.com/jaypipes/ghw v0.12.0
+	github.com/rs/zerolog v1.34.0
 	github.com/sirupsen/logrus v1.9.3
 	github.com/spf13/viper v1.19.0
 	github.com/syndtr/gocapability v0.0.0-20200815063812-42c35b437635
@@ -21,6 +22,8 @@ require (
 	github.com/hashicorp/hcl v1.0.0 // indirect
 	github.com/jaypipes/pcidb v1.0.0 // indirect
 	github.com/magiconair/properties v1.8.7 // indirect
+	github.com/mattn/go-colorable v0.1.13 // indirect
+	github.com/mattn/go-isatty v0.0.19 // indirect
 	github.com/mitchellh/go-homedir v1.1.0 // indirect
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
 	github.com/pelletier/go-toml/v2 v2.2.2 // indirect
