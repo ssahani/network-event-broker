@@ -1,177 +1,278 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2023 VMware, Inc.
 
 package network
 
 import (
+	"context"
 	"net"
 	"strconv"
 	"strings"
-	"syscall"
 
-	log "github.com/sirupsen/logrus"
+	"github.com/rs/zerolog/log"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 
 	"github.com/vmware/network-event-broker/pkg/system"
 )
 
-const (
-	MaxChannelSize = 1024
-)
-
+// WatchNetwork starts goroutines to monitor network addresses, routes, and links.
 func WatchNetwork(n *Network) {
-	go n.watchAddresses()
-	go n.watchRoutes()
-	go n.watchLinks()
+	if n == nil {
+		log.Fatal().Msg("Network instance cannot be nil")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go n.watchAddresses(ctx)
+	go n.watchRoutes(ctx)
+	go n.watchLinks(ctx)
+
+	// Handle graceful shutdown on context cancellation.
+	<-ctx.Done()
+	log.Info().Msg("Network watchers stopped")
 }
 
-func (n *Network) watchAddresses() {
-	updates := make(chan netlink.AddrUpdate)
-	done := make(chan struct{}, MaxChannelSize)
+// watchAddresses monitors IP address updates and applies/removes routing rules.
+func (n *Network) watchAddresses(ctx context.Context) {
+	const maxChannelSize = 1024
+	updates := make(chan netlink.AddrUpdate, maxChannelSize)
+	done := make(chan struct{}, maxChannelSize)
 
 	if err := netlink.AddrSubscribeWithOptions(updates, done, netlink.AddrSubscribeOptions{
 		ErrorCallback: func(err error) {
-			log.Errorf("Received error from IP address update subscription: %v", err)
+			log.Error().Err(err).Msg("Error in IP address update subscription")
 		},
 	}); err != nil {
-		log.Errorf("Failed to subscribe IP address update: %v", err)
+		log.Fatal().Err(err).Msg("Failed to subscribe to IP address updates")
 	}
 
 	for {
 		select {
+		case <-ctx.Done():
+			log.Info().Msg("Stopping address watcher")
+			close(done)
+			return
 		case <-done:
-			log.Infoln("Address watcher failed")
-		case updates, ok := <-updates:
+			log.Warn().Msg("Address watcher terminated unexpectedly")
+			return
+		case update, ok := <-updates:
 			if !ok {
-				break
+				log.Warn().Msg("Address update channel closed")
+				return
 			}
 
-			a := updates.LinkAddress.IP.String()
-			mask, _ := updates.LinkAddress.Mask.Size()
-
-			if strings.HasPrefix(a, "fe80") {
-				break
+			addr := update.LinkAddress.IP.String()
+			if strings.HasPrefix(addr, "fe80") {
+				log.Debug().Str("address", addr).Msg("Skipping link-local IPv6 address")
+				continue
 			}
 
-			ip := a + "/" + strconv.Itoa(mask)
+			mask, _ := update.LinkAddress.Mask.Size()
+			ip := addr + "/" + strconv.Itoa(mask)
+			log.Info().
+				Str("address", ip).
+				Int("ifindex", update.LinkIndex).
+				Bool("new", update.NewAddr).
+				Msg("Received IP address update")
 
-			log.Infof("Received IP update: %v", updates)
-
-			if updates.NewAddr {
-				log.Infof("IP address='%s' added to link ifindex='%d'", ip, updates.LinkIndex)
-
-				n.oneAddressRuleAdd(ip, n.LinksByIndex[updates.LinkIndex], updates.LinkIndex)
+			if update.NewAddr {
+				linkName, exists := n.LinksByIndex[update.LinkIndex]
+				if !exists {
+					log.Warn().Int("ifindex", update.LinkIndex).Msg("Link not found for address update")
+					continue
+				}
+				if err := n.addAddressRule(ip, linkName, update.LinkIndex); err != nil {
+					log.Error().
+						Str("address", ip).
+						Str("link", linkName).
+						Int("ifindex", update.LinkIndex).
+						Err(err).
+						Msg("Failed to add routing rule")
+				}
 			} else {
-				log.Infof("IP address='%s' removed from link ifindex='%d'", ip, updates.LinkIndex)
-
-				log.Debugf("Dropping configuration link ifindex='%d' address='%s'", updates.LinkIndex, ip)
-
-				n.dropConfiguration(updates.LinkIndex, ip)
+				n.dropConfiguration(update.LinkIndex, ip)
 			}
 		}
 	}
 }
 
-func (n *Network) watchRoutes() {
-	updates := make(chan netlink.RouteUpdate)
-	done := make(chan struct{}, MaxChannelSize)
+// watchRoutes monitors route updates and triggers scripts for link changes.
+func (n *Network) watchRoutes(ctx context.Context) {
+	const maxChannelSize = 1024
+	updates := make(chan netlink.RouteUpdate, maxChannelSize)
+	done := make(chan struct{}, maxChannelSize)
+
 	if err := netlink.RouteSubscribe(updates, done); err != nil {
-		log.Errorf("can't subscribe route change event: %v", err)
+		log.Fatal().Err(err).Msg("Failed to subscribe to route updates")
 	}
 
 	for {
 		select {
+		case <-ctx.Done():
+			log.Info().Msg("Stopping route watcher")
+			close(done)
+			return
 		case <-done:
-			log.Infoln("route watcher failed")
-		case updates, ok := <-updates:
+			log.Warn().Msg("Route watcher terminated unexpectedly")
+			return
+		case update, ok := <-updates:
 			if !ok {
-				break
+				log.Warn().Msg("Route update channel closed")
+				return
 			}
 
-			log.Debugf("Received route update: %v", updates)
+			link, err := net.InterfaceByIndex(update.LinkIndex)
+			if err != nil {
+				log.Error().Int("ifindex", update.LinkIndex).Err(err).Msg("Failed to get link by index")
+				continue
+			}
 
-			link, _ := net.InterfaceByIndex(updates.LinkIndex)
-			system.ExecuteScripts(link.Name, updates.LinkIndex)
+			log.Debug().
+				Str("link", link.Name).
+				Int("ifindex", update.LinkIndex).
+				Str("route", update.String()).
+				Msg("Received route update")
+
+			if err := system.ExecuteScripts(link.Name, update.LinkIndex); err != nil {
+				log.Error().
+					Str("link", link.Name).
+					Int("ifindex", update.LinkIndex).
+					Err(err).
+					Msg("Failed to execute scripts for route update")
+			}
 		}
 	}
 }
 
-func (n *Network) watchLinks() {
-	updates := make(chan netlink.LinkUpdate)
-	done := make(chan struct{}, MaxChannelSize)
+// watchLinks monitors link updates and updates the Network's link mappings.
+func (n *Network) watchLinks(ctx context.Context) {
+	const maxChannelSize = 1024
+	updates := make(chan netlink.LinkUpdate, maxChannelSize)
+	done := make(chan struct{}, maxChannelSize)
 
 	if err := netlink.LinkSubscribeWithOptions(updates, done, netlink.LinkSubscribeOptions{
 		ErrorCallback: func(err error) {
-			log.Errorf("Received error from link update subscription: %v", err)
+			log.Error().Err(err).Msg("Error in link update subscription")
 		},
 	}); err != nil {
-		log.Errorf("Failed to subscribe link update: %v", err)
+		log.Fatal().Err(err).Msg("Failed to subscribe to link updates")
 	}
 
 	for {
 		select {
+		case <-ctx.Done():
+			log.Info().Msg("Stopping link watcher")
+			close(done)
+			return
 		case <-done:
-			log.Infoln("Link watcher failed")
-		case updates, ok := <-updates:
+			log.Warn().Msg("Link watcher terminated unexpectedly")
+			return
+		case update, ok := <-updates:
 			if !ok {
-				break
+				log.Warn().Msg("Link update channel closed")
+				return
 			}
 
-			log.Infof("Received Link update: %v", updates)
+			log.Info().
+				Str("link", update.Attrs().Name).
+				Int("ifindex", int(update.Index)).
+				Str("type", update.Header.Type.String()).
+				Msg("Received link update")
 
-			n.updateLink(updates)
+			n.updateLink(update)
 		}
 	}
 }
 
-func (n *Network) updateLink(updates netlink.LinkUpdate) {
+// updateLink updates the Network's link mappings based on link updates.
+func (n *Network) updateLink(update netlink.LinkUpdate) {
 	n.Mutex.Lock()
 	defer n.Mutex.Unlock()
 
-	switch updates.Header.Type {
-	case syscall.RTM_DELLINK:
+	name := update.Attrs().Name
+	if name == "" {
+		log.Warn().Int("ifindex", int(update.Index)).Msg("Link update missing name")
+		return
+	}
 
-		delete(n.LinksByIndex, int(updates.Index))
-		delete(n.LinksByName, updates.Attrs().Name)
+	switch update.Header.Type {
+	case unix.RTM_DELLINK:
+		delete(n.LinksByIndex, int(update.Index))
+		delete(n.LinksByName, name)
+		log.Debug().Str("link", name).Int("ifindex", int(update.Index)).Msg("Link removed")
 
-		log.Debugf("Link='%s' ifindex='%d' removed", updates.Attrs().Name, int(updates.Index))
-
-	case syscall.RTM_NEWLINK:
-
-		n.LinksByIndex[int(updates.Index)] = updates.Attrs().Name
-		n.LinksByName[updates.Attrs().Name] = int(updates.Index)
-
-		log.Debugf("New link='%s' ifindex='%d' added", updates.Attrs().Name, int(updates.Index))
+	case unix.RTM_NEWLINK:
+		n.LinksByIndex[int(update.Index)] = name
+		n.LinksByName[name] = int(update.Index)
+		log.Debug().Str("link", name).Int("ifindex", int(update.Index)).Msg("Link added")
 	}
 }
 
+// dropConfiguration removes routing rules and routes for a given address and interface.
 func (n *Network) dropConfiguration(ifIndex int, address string) {
 	n.Mutex.Lock()
 	defer n.Mutex.Unlock()
 
-	log.Debugf("Dropping routing rules for address='%s' link='%s' ifindex='%d'", address, n.LinksByIndex[ifIndex], ifIndex)
+	if address == "" {
+		log.Warn().Int("ifindex", ifIndex).Msg("Cannot drop configuration for empty address")
+		return
+	}
 
-	rule, ok := n.RoutingRulesByAddressFrom[address]
-	if ok {
-		rule.RoutingPolicyRuleRemove()
+	linkName, exists := n.LinksByIndex[ifIndex]
+	if !exists {
+		log.Warn().Int("ifindex", ifIndex).Str("address", address).Msg("Link not found for dropping configuration")
+		return
+	}
+
+	log.Debug().
+		Str("address", address).
+		Str("link", linkName).
+		Int("ifindex", ifIndex).
+		Msg("Dropping configuration")
+
+	// Remove 'from' routing rule.
+	if rule, ok := n.RoutingRulesByAddressFrom[address]; ok {
+		if err := rule.RoutingPolicyRuleRemove(); err != nil {
+			log.Error().
+				Str("address", address).
+				Str("link", linkName).
+				Int("ifindex", ifIndex).
+				Err(err).
+				Msg("Failed to remove 'from' routing rule")
+		}
 		delete(n.RoutingRulesByAddressFrom, address)
 	}
 
-	rule, ok = n.RoutingRulesByAddressTo[address]
-	if ok {
-		rule.RoutingPolicyRuleRemove()
+	// Remove 'to' routing rule.
+	if rule, ok := n.RoutingRulesByAddressTo[address]; ok {
+		if err := rule.RoutingPolicyRuleRemove(); err != nil {
+			log.Error().
+				Str("address", address).
+				Str("link", linkName).
+				Int("ifindex", ifIndex).
+				Err(err).
+				Msg("Failed to remove 'to' routing rule")
+		}
 		delete(n.RoutingRulesByAddressTo, address)
 	}
 
-	rt, ok := n.RoutesByIndex[ifIndex]
-	if ok {
+	// Remove route if no rules remain for the table.
+	if rt, ok := n.RoutesByIndex[ifIndex]; ok && n.IsRulesByTableEmpty(rt.Table) {
+		log.Debug().
+			Str("gw", rt.Gw).
+			Str("link", linkName).
+			Int("ifindex", ifIndex).
+			Int("table", rt.Table).
+			Msg("Dropping route as no rules remain")
 
-		if n.isRulesByTableEmpty(rt.Table) {
-
-			log.Debugf("Dropping GW='%s' link='%s' ifindex='%d'  Table='%d'", rt.Gw, n.LinksByIndex[ifIndex], ifIndex, rt.Table)
-
-			rt.RouteRemove()
-			delete(n.RoutesByIndex, ifIndex)
+		if err := rt.RouteRemove(); err != nil {
+			log.Error().
+				Str("gw", rt.Gw).
+				Str("link", linkName).
+				Int("ifindex", ifIndex).
+				Int("table", rt.Table).
+				Err(err).
+				Msg("Failed to remove route")
 		}
+		delete(n.RoutesByIndex, ifIndex)
 	}
 }
