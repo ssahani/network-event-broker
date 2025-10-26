@@ -4,17 +4,18 @@
 package listeners
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
-	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/godbus/dbus/v5"
-	log "github.com/sirupsen/logrus"
+	"github.com/rs/zerolog/log"
 
 	"github.com/vmware/network-event-broker/pkg/bus"
 	"github.com/vmware/network-event-broker/pkg/conf"
@@ -22,187 +23,222 @@ import (
 	"github.com/vmware/network-event-broker/pkg/system"
 )
 
+// Constants for DBus interfaces, paths, and timeouts.
 const (
-	networkInterface  = "org.freedesktop.network1"
-	networkObjectPath = "/org/freedesktop/network1"
-
-	networkInterfaceLink       = "org.freedesktop.network1.Link"
-	networkInterfaceLinkEscape = networkObjectPath + "/link/_3"
-
-	defaultRequestTimeout = 5 * time.Second
+	networkInterface         = "org.freedesktop.network1"
+	networkObjectPath        = "/org/freedesktop/network1"
+	networkInterfaceLink     = networkInterface + ".Link"
+	networkInterfaceLinkBase = networkObjectPath + "/link/_3"
+	defaultRequestTimeout    = 5 * time.Second
 )
 
-func executeNetworkdLinkStateScripts(link string, index int, k string, v string, c *conf.Config) error {
+// executeNetworkdLinkStateScripts runs scripts in the appropriate state directory for a link state change.
+func executeNetworkdLinkStateScripts(link string, index int, key, value string, cfg *conf.Config) error {
+	if link == "" || key == "" || value == "" {
+		return fmt.Errorf("invalid input: link=%q, key=%q, value=%q", link, key, value)
+	}
+
 	scriptDirs, err := system.ReadAllScriptDirs(conf.ConfPath)
 	if err != nil {
-		log.Errorf("Failed to find any scripts in conf dir: %+v", err)
-		return err
+		log.Error().Err(err).Str("path", conf.ConfPath).Msg("Failed to read script directories")
+		return fmt.Errorf("failed to read script directories: %w", err)
 	}
 
-	for _, d := range scriptDirs {
-		stateDir := v + ".d"
-
-		if stateDir == d {
-			scripts, err := system.ReadAllScriptInConfDir(path.Join(conf.ConfPath, d))
-			if err != nil {
-				log.Errorf("Failed to read script dir '%s'", path.Join(conf.ConfPath, d))
-				continue
-			}
-
-			if len(scripts) <= 0 {
-				log.Debugf("No script in '%+v'", d)
-				continue
-			}
-
-			path.Join(conf.ConfPath, d)
-			linkNameEnvArg := "LINK=" + link
-			linkIndexEnvArg := "LINKINDEX=" + strconv.Itoa(index)
-			linkStateEnvArg := k + "=" + v
-
-			leaseFile := path.Join(conf.NetworkdLeasePath, strconv.Itoa(index))
-			leaseLines, err := system.ReadLines(leaseFile)
-			if err != nil {
-				log.Debugf("Failed to read lease file of link='%+v'", link, err)
-				continue
-			}
-
-			var leaseArg string
-			if len(leaseLines) > 0 {
-				leaseArg = "DHCP_LEASE="
-				leaseArg += strings.Join(leaseLines, " ")
-			}
-
-			var jsonData string
-			if c.Network.EmitJSON {
-				m, err := acquireLink(link)
-				if err == nil {
-					j, _ := json.Marshal(m)
-					jsonData = "JSON=" + string(j)
-
-					log.Debugf("JSON: %v", jsonData)
-				}
-			}
-
-			for _, s := range scripts {
-				script := path.Join(conf.ConfPath, d, s)
-
-				log.Debugf("Executing script '%s' in dir='%v' for link='%s'", script, d, link)
-
-				cmd := exec.Command(script)
-				cmd.Env = append(os.Environ(),
-					linkNameEnvArg,
-					linkNameEnvArg,
-					linkIndexEnvArg,
-					linkStateEnvArg,
-					leaseArg,
-				)
-
-				if c.Network.EmitJSON {
-					cmd.Env = append(cmd.Env, jsonData)
-				}
-
-				if err := cmd.Run(); err != nil {
-					log.Errorf("Failed to execute script='%s': %v", script, err)
-					continue
-				}
-
-				log.Debugf("Successfully executed script '%s' in dir='%v' for link='%s'", script, d, link)
-			}
-		}
-	}
-
-	return nil
-}
-
-func executeNetworkdManagerScripts(k string, v string) error {
-	managerStatePath := path.Join(conf.ConfPath, conf.ManagerStateDir)
-
-	scripts, err := system.ReadAllScriptInConfDir(managerStatePath)
-	if err != nil {
-		log.Errorf("Failed to read script dir '%s': %+v", managerStatePath, err)
-		return err
-	}
-
-	for _, s := range scripts {
-		script := path.Join(managerStatePath, s)
-
-		log.Debugf("Executing script '%s' in dir='%s'", script, managerStatePath)
-
-		managerStateEnvArg := k + "=" + v
-		cmd := exec.Command(script)
-		cmd.Env = append(os.Environ(),
-			managerStateEnvArg,
-			managerStateEnvArg,
-		)
-
-		if err := cmd.Run(); err != nil {
-			log.Errorf("Failed to execute script='%s': %+v", script, err)
+	stateDir := value + ".d"
+	for _, dir := range scriptDirs {
+		if dir != stateDir {
 			continue
 		}
 
-		log.Debugf("Successfully executed script '%s' in dir='%v' for manager state", script, managerStatePath)
+		dirPath := filepath.Join(conf.ConfPath, dir)
+		scripts, err := system.ReadAllScriptInConfDir(dirPath)
+		if err != nil {
+			log.Warn().Err(err).Str("dir", dirPath).Msg("Failed to read scripts in directory")
+			continue
+		}
+
+		if len(scripts) == 0 {
+			log.Debug().Str("dir", dir).Msg("No scripts found in directory")
+			continue
+		}
+
+		// Prepare environment variables.
+		env := append(os.Environ(),
+			"LINK="+link,
+			fmt.Sprintf("LINKINDEX=%d", index),
+			fmt.Sprintf("%s=%s", key, value),
+		)
+
+		// Add DHCP lease information if available.
+		leaseFile := filepath.Join(conf.NetworkdLeasePath, strconv.Itoa(index))
+		if leaseLines, err := system.ReadLines(leaseFile); err == nil && len(leaseLines) > 0 {
+			env = append(env, "DHCP_LEASE="+strings.Join(leaseLines, " "))
+		} else {
+			log.Debug().Str("file", leaseFile).Err(err).Msg("Failed to read lease file")
+		}
+
+		// Add JSON data if enabled.
+		if cfg.Network.EmitJSON {
+			if linkData, err := acquireLink(link); err == nil {
+				if jsonBytes, err := json.Marshal(linkData); err == nil {
+					env = append(env, "JSON="+string(jsonBytes))
+					log.Debug().Str("link", link).Str("json", string(jsonBytes)).Msg("Generated JSON data")
+				} else {
+					log.Warn().Str("link", link).Err(err).Msg("Failed to marshal link data")
+				}
+			} else {
+				log.Warn().Str("link", link).Err(err).Msg("Failed to acquire link data for JSON")
+			}
+		}
+
+		// Execute scripts.
+		for _, script := range scripts {
+			scriptPath := filepath.Join(dirPath, script)
+			log.Debug().Str("script", scriptPath).Str("link", link).Str("state", value).Msg("Executing script")
+
+			ctx, cancel := context.WithTimeout(context.Background(), defaultRequestTimeout)
+			defer cancel()
+
+			cmd := exec.CommandContext(ctx, scriptPath)
+			cmd.Env = env
+
+			if err := cmd.Run(); err != nil {
+				log.Error().Str("script", scriptPath).Err(err).Msg("Failed to execute script")
+				continue
+			}
+
+			log.Debug().Str("script", scriptPath).Str("link", link).Msg("Successfully executed script")
+		}
 	}
 
 	return nil
 }
 
-func processDBusLinkMessage(n *network.Network, v *dbus.Signal, c *conf.Config) error {
-	if !strings.HasPrefix(string(v.Path), networkInterfaceLinkEscape) {
+// executeNetworkdManagerScripts runs scripts in the manager state directory for a manager state change.
+func executeNetworkdManagerScripts(key, value string) error {
+	if key == "" || value == "" {
+		return fmt.Errorf("invalid input: key=%q, value=%q", key, value)
+	}
+
+	managerStatePath := filepath.Join(conf.ConfPath, conf.ManagerStateDir)
+	scripts, err := system.ReadAllScriptInConfDir(managerStatePath)
+	if err != nil {
+		log.Error().Err(err).Str("dir", managerStatePath).Msg("Failed to read manager script directory")
+		return fmt.Errorf("failed to read manager script directory: %w", err)
+	}
+
+	if len(scripts) == 0 {
+		log.Debug().Str("dir", managerStatePath).Msg("No scripts found in manager directory")
 		return nil
 	}
 
-	strIndex := strings.TrimPrefix(string(v.Path), networkInterfaceLinkEscape)
+	for _, script := range scripts {
+		scriptPath := filepath.Join(managerStatePath, script)
+		log.Debug().Str("script", scriptPath).Str("key", key).Str("value", value).Msg("Executing manager script")
+
+		ctx, cancel := context.WithTimeout(context.Background(), defaultRequestTimeout)
+		defer cancel()
+
+		cmd := exec.CommandContext(ctx, scriptPath)
+		cmd.Env = append(os.Environ(), fmt.Sprintf("%s=%s", key, value))
+
+		if err := cmd.Run(); err != nil {
+			log.Error().Str("script", scriptPath).Err(err).Msg("Failed to execute manager script")
+			continue
+		}
+
+		log.Debug().Str("script", scriptPath).Msg("Successfully executed manager script")
+	}
+
+	return nil
+}
+
+// processDBusLinkMessage processes a DBus signal for a link state change.
+func processDBusLinkMessage(n *network.Network, v *dbus.Signal, cfg *conf.Config) error {
+	if !strings.HasPrefix(string(v.Path), networkInterfaceLinkBase) {
+		return nil
+	}
+
+	strIndex := strings.TrimPrefix(string(v.Path), networkInterfaceLinkBase)
 	index, err := strconv.Atoi(strIndex)
 	if err != nil {
-		log.Errorf("Failed to convert ifindex=\"%s\" to integer: %+v", strIndex, err)
+		log.Error().Str("ifindex", strIndex).Err(err).Msg("Failed to parse interface index")
 		return nil
 	}
 
-	log.Debugf("Received DBus signal from systemd-networkd for ifindex='%d'", index)
+	if n.LinksByIndex == nil || n.LinksByIndex[index] == "" {
+		log.Warn().Int("ifindex", index).Msg("Unknown link index")
+		return nil
+	}
 
-	linkState := v.Body[1].(map[string]dbus.Variant)
-	for k, v := range linkState {
-		s := strings.Trim(v.String(), "\"")
+	link := n.LinksByIndex[index]
+	log.Debug().Int("ifindex", index).Str("link", link).Msg("Received DBus link signal")
 
-		log.Debugf("Link='%s' ifindex='%d' changed state '%s'='%s'", n.LinksByIndex[index], index, k, s)
+	linkState, ok := v.Body[1].(map[string]dbus.Variant)
+	if !ok {
+		log.Error().Int("ifindex", index).Msg("Invalid link state format")
+		return fmt.Errorf("invalid link state format for ifindex %d", index)
+	}
 
-		if c.Network.Links != "" {
-			if strings.Contains(c.Network.Links, n.LinksByIndex[index]) {
-				executeNetworkdLinkStateScripts(n.LinksByIndex[index], index, k, s, c)
+	for key, variant := range linkState {
+		value := strings.Trim(variant.String(), "\"")
+		log.Debug().Str("link", link).Int("ifindex", index).Str("key", key).Str("value", value).Msg("Link state changed")
+
+		// Execute scripts only if the link is in the configured list or no list is specified.
+		if cfg.Network.Links == "" || strings.Contains(cfg.Network.Links, link) {
+			if err := executeNetworkdLinkStateScripts(link, index, key, value, cfg); err != nil {
+				log.Warn().Str("link", link).Int("ifindex", index).Err(err).Msg("Failed to execute link state scripts")
 			}
-		} else {
-			executeNetworkdLinkStateScripts(n.LinksByIndex[index], index, k, s, c)
 		}
 
-		if s == "routable" && strings.Contains(c.Network.RoutingPolicyRules, n.LinksByIndex[index]) {
-			network.ConfigureNetwork(n.LinksByIndex[index], n)
+		// Configure routing policies if the link is routable and in the policy rules.
+		if value == "routable" && cfg.Network.RoutingPolicyRules != "" && strings.Contains(cfg.Network.RoutingPolicyRules, link) {
+			if err := network.ConfigureNetwork(link, n); err != nil {
+				log.Warn().Str("link", link).Err(err).Msg("Failed to configure network")
+			}
 		}
 	}
 
 	return nil
 }
 
+// processDBusManagerMessage processes a DBus signal for a manager state change.
 func processDBusManagerMessage(n *network.Network, v *dbus.Signal) error {
-	state := v.Body[1].(map[string]dbus.Variant)
+	state, ok := v.Body[1].(map[string]dbus.Variant)
+	if !ok {
+		log.Error().Msg("Invalid manager state format")
+		return fmt.Errorf("invalid manager state format")
+	}
 
-	for k, v := range state {
-		s := strings.Trim(v.String(), "\"")
+	for key, variant := range state {
+		value := strings.Trim(variant.String(), "\"")
+		log.Debug().Str("key", key).Str("value", value).Msg("Manager state changed")
 
-		log.Debugf("Manager changed state '%v='%v'", k, s)
-
-		executeNetworkdManagerScripts(k, s)
+		if err := executeNetworkdManagerScripts(key, value); err != nil {
+			log.Warn().Err(err).Str("key", key).Str("value", value).Msg("Failed to execute manager scripts")
+		}
 	}
 
 	return nil
 }
 
-func WatchNetworkd(n *network.Network, c *conf.Config, finished chan bool) error {
+// WatchNetworkd monitors systemd-networkd DBus signals for link and manager state changes.
+func WatchNetworkd(n *network.Network, cfg *conf.Config, finished chan bool) error {
+	if n == nil || cfg == nil {
+		return fmt.Errorf("network or config cannot be nil")
+	}
+
 	conn, err := dbus.ConnectSystemBus()
 	if err != nil {
-		log.Fatalf("Failed to connect to system bus: %v", err)
-		os.Exit(1)
+		log.Fatal().Err(err).Msg("Failed to connect to system bus")
 	}
-	defer conn.Close()
+
+	defer func() {
+		if err := conn.Close(); err != nil {
+			log.Warn().Err(err).Msg("Failed to close DBus connection")
+		}
+		finished <- true
+	}()
 
 	opts := []dbus.MatchOption{
 		dbus.WithMatchSender(networkInterface),
@@ -211,30 +247,47 @@ func WatchNetworkd(n *network.Network, c *conf.Config, finished chan bool) error
 	}
 
 	if err := conn.AddMatchSignal(opts...); err != nil {
-		log.Errorf("Failed to add match signal for '%s`: %+v", networkInterface, err)
-		return err
+		log.Error().Err(err).Str("interface", networkInterface).Msg("Failed to add DBus match signal")
+		return fmt.Errorf("failed to add DBus match signal: %w", err)
 	}
 
-	log.Infoln("Listening to 'systemd-networkd' DBus events")
-
+	log.Info().Msg("Listening to systemd-networkd DBus events")
 	sigChannel := make(chan *dbus.Signal, 512)
 	conn.Signal(sigChannel)
 
 	for v := range sigChannel {
-		w := fmt.Sprintf("%v", v.Body[0])
+		if v == nil || len(v.Body) < 1 {
+			log.Warn().Msg("Received invalid DBus signal")
+			continue
+		}
 
-		if strings.HasPrefix(w, networkInterfaceLink) {
-			log.Debugf("Received Link DBus signal from 'systemd-networkd'")
+		iface, ok := v.Body[0].(string)
+		if !ok {
+			log.Warn().Msg("Invalid DBus signal interface format")
+			continue
+		}
 
-			go processDBusLinkMessage(n, v, c)
-
-		} else if strings.HasPrefix(w, "org.freedesktop.network1.Manager") {
-			log.Debugf("Received Manager DBus signal from 'systemd-networkd'")
-
-			go processDBusManagerMessage(n, v)
+		ctx, cancel := context.WithTimeout(context.Background(), defaultRequestTimeout)
+		if strings.HasPrefix(iface, networkInterfaceLink) {
+			log.Debug().Str("interface", iface).Msg("Processing link DBus signal")
+			go func() {
+				defer cancel()
+				if err := processDBusLinkMessage(n, v, cfg); err != nil {
+					log.Warn().Err(err).Str("interface", iface).Msg("Failed to process link signal")
+				}
+			}()
+		} else if strings.HasPrefix(iface, dbusManagerInterface) {
+			log.Debug().Str("interface", iface).Msg("Processing manager DBus signal")
+			go func() {
+				defer cancel()
+				if err := processDBusManagerMessage(n, v); err != nil {
+					log.Warn().Err(err).Str("interface", iface).Msg("Failed to process manager signal")
+				}
+			}()
+		} else {
+			cancel()
 		}
 	}
 
-	finished <- true
 	return nil
 }
