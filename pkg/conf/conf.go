@@ -5,31 +5,29 @@ package conf
 
 import (
 	"errors"
+	"fmt"
 	"os"
-	"path"
+	"path/filepath"
 
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 )
 
+// Constants for configuration paths and defaults.
 const (
-	Version  = "0.1"
-	ConfPath = "/etc/network-broker/"
-	ConfFile = "network-broker"
-
+	Version           = "0.1"
+	ConfPath          = "/etc/network-broker"
+	ConfFile          = "network-broker"
 	DHClientLeaseFile = "/var/lib/dhclient/dhclient.leases"
 	NetworkdLeasePath = "/run/systemd/netif/leases"
-
 	ManagerStateDir   = "manager.d"
 	RoutesModifiedDir = "routes.d"
-
-	ROUTE_TABLE_BASE = 9999
-
-	DefaultLogLevel  = "info"
-	DefaultLogFormat = "text"
+	RouteTableBase    = 9999
+	DefaultLogLevel   = "info"
+	DefaultLogFormat  = "text"
 )
 
-// Config file key value
+// Network holds network-related configuration.
 type Network struct {
 	Links              string `mapstructure:"Links"`
 	RoutingPolicyRules string `mapstructure:"RoutingPolicyRules"`
@@ -39,53 +37,73 @@ type Network struct {
 	EmitJSON           bool   `mapstructure:"EmitJSON"`
 }
 
+// System holds system-related configuration.
 type System struct {
 	Generator string `mapstructure:"Generator"`
 	LogLevel  string `mapstructure:"LogLevel"`
 	LogFormat string `mapstructure:"LogFormat"`
 }
+
+// Config holds the complete configuration structure.
 type Config struct {
 	Network Network `mapstructure:"Network"`
 	System  System  `mapstructure:"System"`
 }
 
-func createEventScriptDirs() error {
-	var eventStateDirs [7]string
-
-	eventStateDirs[0] = "no-carrier.d"
-	eventStateDirs[1] = "carrier.d"
-	eventStateDirs[2] = "degraded.d"
-	eventStateDirs[3] = "routable.d"
-	eventStateDirs[4] = "configured.d"
-	eventStateDirs[5] = ManagerStateDir
-	eventStateDirs[6] = RoutesModifiedDir
-
-	for _, d := range eventStateDirs {
-		os.MkdirAll(path.Join(ConfPath, d), 0755)
+// Validate validates the configuration.
+func (c *Config) Validate() error {
+	if c.System.LogLevel != "" {
+		if _, err := logrus.ParseLevel(c.System.LogLevel); err != nil {
+			return fmt.Errorf("invalid log level: %s", c.System.LogLevel)
+		}
 	}
-
+	if c.System.LogFormat != "" && c.System.LogFormat != "json" && c.System.LogFormat != "text" {
+		return fmt.Errorf("invalid log format: %s", c.System.LogFormat)
+	}
 	return nil
 }
 
+// createEventScriptDirs creates directories for event scripts.
+func createEventScriptDirs() error {
+	eventStateDirs := []string{
+		"no-carrier.d",
+		"carrier.d",
+		"degraded.d",
+		"routable.d",
+		"configured.d",
+		ManagerStateDir,
+		RoutesModifiedDir,
+	}
+
+	for _, dir := range eventStateDirs {
+		fullPath := filepath.Join(ConfPath, dir)
+		if err := os.MkdirAll(fullPath, 0755); err != nil {
+			return fmt.Errorf("failed to create directory %q: %w", fullPath, err)
+		}
+	}
+	return nil
+}
+
+// SetLogLevel configures the logging level for the application.
 func SetLogLevel(level string) error {
 	if level == "" {
-		return errors.New("unsupported")
+		return errors.New("log level cannot be empty")
 	}
 
-	l, err := logrus.ParseLevel(level)
+	lvl, err := logrus.ParseLevel(level)
 	if err != nil {
-		logrus.Warn("Failed to parse log level, falling back to 'info'")
-		return errors.New("unsupported")
-	} else {
-		logrus.SetLevel(l)
+		logrus.Warnf("Invalid log level %q, falling back to %q", level, DefaultLogLevel)
+		return fmt.Errorf("invalid log level: %w", err)
 	}
 
+	logrus.SetLevel(lvl)
 	return nil
 }
 
+// SetLogFormat configures the logging format for the application.
 func SetLogFormat(format string) error {
 	if format == "" {
-		return errors.New("unsupported")
+		return errors.New("log format cannot be empty")
 	}
 
 	switch format {
@@ -93,66 +111,92 @@ func SetLogFormat(format string) error {
 		logrus.SetFormatter(&logrus.JSONFormatter{
 			DisableTimestamp: true,
 		})
-
 	case "text":
 		logrus.SetFormatter(&logrus.TextFormatter{
 			DisableTimestamp: true,
 		})
-
 	default:
-		logrus.Warn("Failed to parse log format, falling back to 'text'")
-		return errors.New("unsupported")
+		logrus.Warnf("Invalid log format %q, falling back to %q", format, DefaultLogFormat)
+		return fmt.Errorf("invalid log format: %s", format)
 	}
-
 	return nil
 }
 
+// Parse loads and parses the configuration from a file.
 func Parse() (*Config, error) {
 	viper.SetConfigName(ConfFile)
 	viper.AddConfigPath(ConfPath)
+	viper.SetConfigType("toml")
 
+	// Set default values.
+	viper.SetDefault("System.LogLevel", DefaultLogLevel)
+	viper.SetDefault("System.LogFormat", DefaultLogFormat)
+
+	// Read configuration file.
 	if err := viper.ReadInConfig(); err != nil {
-		logrus.Errorf("%+v", err)
+		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
+			logrus.Warn("Configuration file not found, using defaults")
+		} else {
+			logrus.Errorf("Failed to read configuration file %s/%s.toml: %v", ConfPath, ConfFile, err)
+			return nil, fmt.Errorf("failed to read configuration: %w", err)
+		}
 	}
 
-	viper.SetDefault("System.LogFormat", DefaultLogLevel)
-	viper.SetDefault("System.LogLevel", DefaultLogFormat)
+	// Unmarshal configuration into struct.
+	cfg := &Config{}
+	if err := viper.Unmarshal(cfg); err != nil {
+		logrus.Errorf("Failed to parse configuration file %s/%s.toml: %v", ConfPath, ConfFile, err)
+		return nil, fmt.Errorf("failed to parse configuration: %w", err)
+	}
 
-	c := Config{}
-	if err := viper.Unmarshal(&c); err != nil {
-		logrus.Errorf("Failed to parse config file: '/etc/network-broker/network-broker.toml'")
+	// Validate configuration.
+	if err := cfg.Validate(); err != nil {
+		logrus.Errorf("Invalid configuration: %v", err)
 		return nil, err
 	}
 
-	if err := SetLogLevel(viper.GetString("NETWORK_EVENT_LOG_LEVEL")); err != nil {
-		if err := SetLogLevel(c.System.LogLevel); err != nil {
-			c.System.LogLevel = DefaultLogLevel
+	// Configure logging from environment variables or config.
+	logLevel := viper.GetString("NETWORK_EVENT_LOG_LEVEL")
+	if logLevel == "" {
+		logLevel = cfg.System.LogLevel
+	}
+	if err := SetLogLevel(logLevel); err != nil {
+		logrus.Warnf("Failed to set log level %q, using default %q", logLevel, DefaultLogLevel)
+		cfg.System.LogLevel = DefaultLogLevel
+		if err := SetLogLevel(DefaultLogLevel); err != nil {
+			logrus.Fatalf("Failed to set default log level %q: %v", DefaultLogLevel, err)
 		}
 	}
 
-	logrus.Debugf("Log level set to '%+v'", logrus.GetLevel().String())
-
-	if err := SetLogFormat(viper.GetString("NETWORK_EVENT_LOG_FORMAT")); err != nil {
-		if err = SetLogFormat(c.System.LogFormat); err != nil {
-			c.System.LogLevel = DefaultLogFormat
+	logFormat := viper.GetString("NETWORK_EVENT_LOG_FORMAT")
+	if logFormat == "" {
+		logFormat = cfg.System.LogFormat
+	}
+	if err := SetLogFormat(logFormat); err != nil {
+		logrus.Warnf("Failed to set log format %q, using default %q", logFormat, DefaultLogFormat)
+		cfg.System.LogFormat = DefaultLogFormat
+		if err := SetLogFormat(DefaultLogFormat); err != nil {
+			logrus.Fatalf("Failed to set default log format %q: %v", DefaultLogFormat, err)
 		}
 	}
 
-	if len(c.System.Generator) > 0 {
-		logrus.Infof("Parsed Generator='%v' from configuration", c.System.Generator)
+	// Log configuration details.
+	logrus.Debugf("Log level set to %q", logrus.GetLevel().String())
+	if cfg.System.Generator != "" {
+		logrus.Infof("Generator: %s", cfg.System.Generator)
 	}
-	if len(c.Network.Links) > 0 {
-		logrus.Infof("Parsed links='%v' from configuration", c.Network.Links)
+	if cfg.Network.Links != "" {
+		logrus.Infof("Links: %s", cfg.Network.Links)
+	}
+	if cfg.Network.RoutingPolicyRules != "" {
+		logrus.Infof("RoutingPolicyRules: %s", cfg.Network.RoutingPolicyRules)
 	}
 
-	if len(c.Network.RoutingPolicyRules) > 0 {
-		logrus.Infof("Parsed RoutingPolicyRules='%+v' from configuration", c.Network.Links)
-	}
-
+	// Create event script directories.
 	if err := createEventScriptDirs(); err != nil {
-		logrus.Errorf("Failed to create default script state directories: %+v", err)
-		return nil, err
+		logrus.Errorf("Failed to create event script directories: %v", err)
+		return nil, fmt.Errorf("failed to create directories: %w", err)
 	}
 
-	return &c, nil
+	return cfg, nil
 }
