@@ -1,43 +1,89 @@
-HASH := $(shell git rev-parse --short HEAD)
-COMMIT_DATE := $(shell git show -s --format=%ci ${HASH})
-BUILD_DATE := $(shell date '+%Y-%m-%d %H:%M:%S')
-VERSION := ${HASH} (${COMMIT_DATE})
+# SPDX-License-Identifier: Apache-2.0
 
-BUILDDIR ?= .
+# Variables for versioning and directories
+HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+COMMIT_DATE := $(shell git show -s --format=%ci $(HASH) 2>/dev/null || echo "unknown")
+BUILD_DATE := $(shell date '+%Y-%m-%d %H:%M:%S')
+VERSION := $(HASH) ($(COMMIT_DATE))
+BUILDDIR ?= bin
 SRCDIR ?= .
+BINARY := $(BUILDDIR)/network-broker
+CONFIG_DIR := /etc/network-broker
+SERVICE_DIR := /lib/systemd/system
+GO := go
+INSTALL := install
+
+# Ensure Go module support
+export GO111MODULE=on
 
 .PHONY: help
 help:
 	@echo "make [TARGETS...]"
 	@echo
-	@echo "This is the maintenance makefile of network-event-broker. The following"
-	@echo "targets are available:"
+	@echo "This is the maintenance Makefile for network-broker. Available targets:"
 	@echo
-	@echo "    help:               Print this usage information."
-	@echo "    build:              Builds project"
-	@echo "    install:            Installs binary, configuration and unit files"
-	@echo "    clean:              Cleans the build"
+	@echo "  help          Print this usage information"
+	@echo "  build         Build the network-broker binary"
+	@echo "  install       Install binary, configuration, and systemd service files"
+	@echo "  clean         Remove build artifacts"
+	@echo "  test          Run unit tests"
+	@echo "  fmt           Format Go source files"
+	@echo "  vet           Run Go vet checks"
+	@echo "  lint          Run golangci-lint checks"
 
-$(BUILDDIR)/:
-	mkdir -p "$@"
+# Ensure build directory exists
+$(BUILDDIR):
+	@mkdir -p $@
 
-$(BUILDDIR)/%/:
-	mkdir -p "$@"
-
+# Build the network-broker binary
 .PHONY: build
-build:
-	- mkdir -p bin
-	go build -ldflags="-X 'main.buildVersion=${VERSION}' -X 'main.buildDate=${BUILD_DATE}'" -o bin/network-broker ./cmd/network-broker
+build: $(BUILDDIR)
+	@echo "Building network-broker (version: $(VERSION), build date: $(BUILD_DATE))"
+	@$(GO) build -ldflags="-X 'main.buildVersion=$(VERSION)' -X 'main.buildDate=$(BUILD_DATE)'" -o $(BINARY) $(SRCDIR)/cmd/network-broker
+	@echo "Binary built at $(BINARY)"
 
+# Install binary, configuration, and systemd service files
 .PHONY: install
-install:
-	install bin/network-broker /usr/bin/
-	install -vdm 755 /etc/network-broker
-	install -m 755  distribution/network-broker.toml /etc/network-broker
-	install -m 0644 distribution/network-broker.service /lib/systemd/system/
-	systemctl daemon-reload
+install: build
+	@echo "Installing network-broker to $(CONFIG_DIR) and $(SERVICE_DIR)"
+	@$(INSTALL) -Dm 755 $(BINARY) /usr/bin/network-broker
+	@$(INSTALL) -Dm 755 -d $(CONFIG_DIR)
+	@$(INSTALL) -Dm 644 distribution/network-broker.yaml $(CONFIG_DIR)/network-broker.yaml
+	@$(INSTALL) -Dm 644 distribution/network-broker.service $(SERVICE_DIR)/network-broker.service
+	@systemctl daemon-reload || echo "Warning: Failed to reload systemd daemon"
+	@echo "Installation complete"
 
-PHONY: clean
+# Clean build artifacts
+.PHONY: clean
 clean:
-	go clean
-	rm -rf bin
+	@echo "Cleaning build artifacts"
+	@$(GO) clean
+	@rm -rf $(BUILDDIR)
+	@echo "Clean complete"
+
+# Run unit tests
+.PHONY: test
+test:
+	@echo "Running unit tests"
+	@$(GO) test -v ./...
+
+# Format Go source files
+.PHONY: fmt
+fmt:
+	@echo "Formatting Go source files"
+	@$(GO) fmt ./...
+
+# Run Go vet checks
+.PHONY: vet
+vet:
+	@echo "Running Go vet checks"
+	@$(GO) vet ./...
+
+# Run golangci-lint checks
+.PHONY: lint
+lint:
+	@echo "Running golangci-lint checks"
+	@golangci-lint run ./... || echo "Install golangci-lint: https://golangci-lint.run/usage/install/"
+
+# Ensure build depends on test, fmt, and vet
+build: test fmt vet
