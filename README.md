@@ -1,378 +1,357 @@
-### network-event-broker
-----
-A daemon configures network and executes scripts on network events such as `systemd-networkd's` [DBus](https://www.freedesktop.org/wiki/Software/dbus/) events,
-`dhclient` gains lease lease. It also watches when
+The provided documentation for the `network-event-broker` daemon is clear but can be improved for clarity, completeness, and alignment with modern practices. Since your previous submissions emphasize migrating from TOML to YAML configuration, adopting Zerolog for logging, and enhancing robustness in the `network-broker` application, I’ll revise the documentation to reflect these changes (e.g., updating `network-broker.toml` to `network-broker.yaml`), improve formatting, add missing details, and ensure consistency with the codebase. The revised documentation will be concise, user-friendly, and include examples to address common use cases.
 
-1. An address getting added/removed/modified.
-2. Links added/removed.
+Below is the improved documentation, followed by a Git commit message and commands to update the file (assumed to be `README.md`).
 
-```network-event-broker``` creates 
+---
 
-- link state directories ```carrier.d```,  ```configured.d```,  ```degraded.d```  ```no-carrier.d```  ```routable.d``` 
--  manager state dir ```manager.d``` 
--  `routes.d` (when routes gets modfied)
+### Improved Documentation: README.md
+```markdown
+# network-event-broker
 
+A daemon that configures network settings and executes scripts in response to network events, such as `systemd-networkd` DBus events or `dhclient` lease changes. It monitors:
+
+1. **Address Events**: IP address additions, removals, or modifications.
+2. **Link Events**: Network link additions or removals.
+
+## Overview
+
+`network-event-broker` creates directories under `/etc/network-broker` to store executable scripts triggered by network events:
+
+- `carrier.d`: Scripts run when a link enters the "carrier" state.
+- `configured.d`: Scripts run when a link is fully configured.
+- `degraded.d`: Scripts run when a link is in a degraded state.
+- `no-carrier.d`: Scripts run when a link loses carrier.
+- `routable.d`: Scripts run when a link becomes routable.
+- `manager.d`: Scripts run for manager state changes.
+- `routes-modified.d`: Scripts run when routes are modified.
+
+Example directory structure:
 ```bash
-╭─root@Zeus1 /etc  
-╰─➤  tree network-broker 
-network-broker
+/etc/network-broker
 ├── carrier.d
 ├── configured.d
 ├── degraded.d
 ├── manager.d
-├── network-broker.toml
+├── network-broker.yaml
 ├── no-carrier.d
+├── routable.d
+└── routes-modified.d
 ```
- 
-in ```/etc/network-broker```. Executable scripts can be placed into directories.
 
-Use cases:
+Scripts in these directories are executed with environment variables:
+- `LINK`: The network interface name (e.g., `eth0`).
+- `LINKINDEX`: The interface index.
+- `DHCP_LEASE`: DHCP lease information (for `dhclient` events).
+- `JSON`: JSON-formatted link data (for `systemd-networkd` events, if `EmitJSON=true`).
 
-How to run a command when get a new address is acquired via DHCP ?
+## Use Cases
 
-1. `systemd-networkd's`
- Scripts are executed when the daemon receives the relevant event from `systemd-networkd`. See [networkctl](https://www.freedesktop.org/software/systemd/man/networkctl.html).
+### Running a Command on DHCP Address Acquisition
 
+1. **Using `systemd-networkd`**:
+   Place a script in `/etc/network-broker/routable.d` to execute when a new address is acquired. For example:
+   ```bash
+   # /etc/network-broker/routable.d/log-address.sh
+   #!/bin/bash
+   echo "New address acquired on $LINK (index $LINKINDEX): $JSON" >> /var/log/network-events.log
+   ```
+   Ensure the script is executable:
+   ```bash
+   chmod +x /etc/network-broker/routable.d/log-address.sh
+   ```
+
+   Example log output:
+   ```bash
+   May 14 17:08:13 Zeus log-address.sh[273185]: New address acquired on ens33 (index 2): {"OperationalState":"routable",...}
+   ```
+
+2. **Using `dhclient`**:
+   Scripts in `routable.d` are executed when `/var/lib/dhclient/dhclient.leases` is modified. The `DHCP_LEASE` environment variable contains lease details.
+
+### Configuring a Secondary Network Interface
+
+When multiple interfaces are in the same subnet with a single routing table, traffic may exit via the wrong interface (e.g., `eth1` traffic exiting via `eth0`). To address this, set `RoutingPolicyRules` in the configuration to create a secondary routing table (`ROUTE_TABLE_BASE + ifindex`, default `ROUTE_TABLE_BASE=1000`) with `From` and `To` routing policy rules for the specified link.
+
+Example: For `eth1`, `network-event-broker` adds rules to ensure traffic entering via `eth1` leaves via `eth1`. Rules are automatically removed when addresses are dropped.
+
+## Building from Source
 
 ```bash
-May 14 17:08:13 Zeus cat[273185]: OperationalState="routable"
-May 14 17:08:13 Zeus cat[273185]: LINK=ens33
+make build
+sudo make install
 ```
 
-2. `dhclient`
-  For `dhclient` scripts will be executed (in the dir ```routable.d```) when the `/var/lib/dhclient/dhclient.leases` file gets modified by `dhclient` and lease information is passed to the scripts as environmental arguments.
+The `make build` command compiles the binary to `bin/network-broker`. The `make install` command installs:
+- Binary: `/usr/bin/network-broker`
+- Config: `/etc/network-broker/network-broker.yaml`
+- Service: `/lib/systemd/system/network-broker.service`
 
-Environment variables `LINK`, `LINKINDEX=` and DHCP lease information `DHCP_LEASE=`  passed to the scripts.
-
-#### How can I make my secondary network interface work ?
-
- When both interfaces are in same subnet and we have only one routing table with one GW, ie. traffic that reach via eth1 tries to leave via eth0(primary interface) which it can't. So we need to add a secondary routing table and routing policy so that the secondary interface uses the new custom routing table. Incase of static address the address and the routes already know. Incase of DHCP it's not predictable.  When `RoutingPolicyRules=` is set, `network-event-broker` automatically configures the routing policy rules `From` and `To` ensuring traffic reaches via eth1 leaves via eth1. 
-
-#### Building from source
-----
-
+Create a non-root user for security (runs with `CAP_NET_ADMIN` and `CAP_SYS_ADMIN` capabilities):
 ```bash
-
-❯ make build
-❯ sudo make install
-
+sudo useradd -M -s /usr/bin/nologin network-broker
 ```
 
-Due to security `network-broker` runs in non root user `network-broker`. It drops all privileges except CAP_NET_ADMIN and CAP_SYS_ADMIN.
+## Configuration
 
-```bash
-❯  useradd -M -s /usr/bin/nologin network-broker
+The configuration file is located at `/etc/network-broker/network-broker.yaml`. Example:
+```yaml
+System:
+  LogLevel: debug
+  LogFormat: text
+  Generator: systemd-networkd
+Network:
+  Links: eth0 eth1
+  RoutingPolicyRules: eth1
+  EmitJSON: true
+  UseDNS: true
+  UseDomain: true
+  UseHostname: true
 ```
 
-### Configuration
-----
+### `[System]` Section
+- **LogLevel**: Logging level (`info`, `warn`, `error`, `debug`, `fatal`). Default: `info`.
+- **LogFormat**: Log output format (`text`, `json`). Default: `text`.
+- **Generator**: Network event source (`systemd-networkd`, `dhclient`). Default: `systemd-networkd`.
 
-Configuration file `network-broker.toml` located in ```/etc/network-broker/``` directory to manage the configuration.
+### `[Network]` Section
+- **Links**: Space-separated list of interfaces to monitor (e.g., `eth0 eth1`). Default: unset (all interfaces).
+- **RoutingPolicyRules**: Space-separated list of interfaces for which to configure `From` and `To` routing policy rules in a custom routing table (`ROUTE_TABLE_BASE + ifindex`). Default: unset.
+- **EmitJSON**: Boolean. If `true`, emits JSON-formatted link data via the `JSON` environment variable (for `systemd-networkd`). Default: `true`.
+- **UseDNS**: Boolean. If `true`, sets DNS servers in `systemd-resolved` via DBus (for `dhclient`). Default: `false`.
+- **UseDomain**: Boolean. If `true`, sends DNS domains to `systemd-resolved` via DBus (for `dhclient`). Default: `false`.
+- **UseHostname**: Boolean. If `true`, sends hostname to `systemd-hostnamed` via DBus (for `dhclient`). Default: `false`.
 
-The `[System]` section takes following Keys:
-``` bash
-
-LogLevel=
-```
-Specifies the log level. Takes one of `info`, `warn`, `error`, `debug` and `fatal`. Defaults to `info`.
-
-```bash
-
-Generator= 
-```
-Specifies the network event generator source to listen. Takes one of `systemd-networkd` or `dhclient`. Defaults to `systemd-networkd`.
-
-
-The `[Network]` section takes following Keys:
-
-```bash
-
-Links=
-```
-A whitespace-separated list of links whose events should be monitored. Defaults to unset.
-
-```bash
-
-RoutingPolicyRules=
-```
-A whitespace-separated list of links for which routing policy rules would be configured per address. When set, `network-broker` automatically adds routing policy rules `from` and `to` in another routing table `(ROUTE_TABLE_BASE = 9999 + ifindex)`. When these addresses are removed, the routing policy rules are also dropped. Defaults to unset.
-
-```bash
-EmitJSON=
-```
-A boolean. When true, JSON format data will be emitted via envorment variable `JSON=` Applies only for `systemd-networkd`. Defaults to true.
-
+### Example JSON Output
+When `EmitJSON=true`, scripts receive a `JSON` environment variable with link details:
 ```json
 {
   "Index": 3,
-  "MTU": 1500,
-  "TxQLen": 1000,
   "Name": "ens37",
-  "AlternativeNames": "",
-  "HardwareAddr": "00:0c:29:5f:d1:43",
-  "Flags": "up|broadcast|multicast",
-  "RawFlags": 69699,
-  "ParentIndex": 0,
-  "MasterIndex": 0,
-  "Namespace": "",
-  "Alias": "",
-  "Statistics": {
-    "RxPackets": 573564,
-    "TxPackets": 373642,
-    "RxBytes": 540984229,
-    "TxBytes": 65923722,
-    "RxErrors": 0,
-    "TxErrors": 0,
-    "RxDropped": 0,
-    "TxDropped": 0,
-    "Multicast": 0,
-    "Collisions": 0,
-    "RxLengthErrors": 0,
-    "RxOverErrors": 0,
-    "RxCrcErrors": 0,
-    "RxFrameErrors": 0,
-    "RxFifoErrors": 0,
-    "RxMissedErrors": 0,
-    "TxAbortedErrors": 0,
-    "TxCarrierErrors": 0,
-    "TxFifoErrors": 0,
-    "TxHeartbeatErrors": 0,
-    "TxWindowErrors": 0,
-    "RxCompressed": 0,
-    "TxCompressed": 0
-  },
-  "Promisc": 0,
-  "Xdp": {
-    "Fd": 0,
-    "Attached": false,
-    "Flags": 0,
-    "ProgId": 0
-  },
-  "EncapType": "ether",
-  "Protinfo": "",
-  "OperState": "up",
-  "NetNsID": 0,
-  "NumTxQueues": 1,
-  "NumRxQueues": 1,
-  "GSOMaxSize": 65536,
-  "GSOMaxSegs": 65535,
-  "Group": 0,
-  "Slave": "",
-  "KernelOperState": "up",
-  "AddressState": "routable",
-  "CarrierState": "carrier",
-  "Driver": "e1000",
-  "IPv4AddressState": "routable",
-  "IPv6AddressState": "off",
-  "LinkFile": "",
-  "Model": "82545EM Gigabit Ethernet Controller (Copper)",
-  "OnlineState": "online",
   "OperationalState": "routable",
-  "Path": "pci-0000:02:05.0",
-  "SetupState": "configuring",
-  "Type": "ether",
-  "Vendor": "Intel Corporation",
-  "ProductID": "100f",
-  "Manufacturer": "",
-  "NetworkFile": "/etc/systemd/network/10-ens37.network",
-  "DNS": [
-    "172.16.130.2"
-  ],
-  "Domains": null,
-  "NTP": null,
   "Address": [
     {
       "IP": "172.16.130.144",
       "Mask": 24,
-      "Label": "ens37",
-      "Flags": 0,
-      "Scope": 0,
-      "Peer": "",
-      "Broadcast": "172.16.130.255",
-      "PreferedLft": 1800,
-      "ValidLft": 1800
-    },
-    {
-      "IP": "fe80::20c:29ff:fe5f:d143",
-      "Mask": 64,
-      "Label": "",
-      "Flags": 192,
-      "Scope": 253,
-      "Peer": "",
-      "Broadcast": "",
-      "PreferedLft": 4294967295,
-      "ValidLft": 4294967295
+      "Label": "ens37"
     }
   ],
   "Routes": [
     {
-      "Scope": 0,
-      "Dst": {
-        "IP": "",
-        "Mask": 0
-      },
+      "Dst": {"IP": "", "Mask": 0},
       "Src": "172.16.130.144",
       "Gw": "172.16.130.2",
-      "MultiPath": "",
-      "Protocol": 16,
-      "Priority": 1024,
-      "Table": 254,
-      "Type": 1,
-      "Tos": 0,
-      "Flags": null,
-      "MPLSDst": "",
-      "NewDst": "",
-      "Encap": "",
-      "MTU": 0,
-      "AdvMSS": 0,
-      "Hoplimit": 0
-    },
-    {
-      "Scope": 253,
-      "Dst": {
-        "IP": "172.16.130.0",
-        "Mask": 24
-      },
-      "Src": "172.16.130.144",
-      "Gw": "",
-      "MultiPath": "",
-      "Protocol": 2,
-      "Priority": 1024,
-      "Table": 254,
-      "Type": 1,
-      "Tos": 0,
-      "Flags": null,
-      "MPLSDst": "",
-      "NewDst": "",
-      "Encap": "",
-      "MTU": 0,
-      "AdvMSS": 0,
-      "Hoplimit": 0
-    },
-    {
-      "Scope": 253,
-      "Dst": {
-        "IP": "172.16.130.2",
-        "Mask": 32
-      },
-      "Src": "172.16.130.144",
-      "Gw": "",
-      "MultiPath": "",
-      "Protocol": 16,
-      "Priority": 1024,
-      "Table": 254,
-      "Type": 1,
-      "Tos": 0,
-      "Flags": null,
-      "MPLSDst": "",
-      "NewDst": "",
-      "Encap": "",
-      "MTU": 0,
-      "AdvMSS": 0,
-      "Hoplimit": 0
-    },
-    {
-      "Scope": 0,
-      "Dst": {
-        "IP": "fe80::",
-        "Mask": 64
-      },
-      "Src": "",
-      "Gw": "",
-      "MultiPath": "",
-      "Protocol": 2,
-      "Priority": 256,
-      "Table": 254,
-      "Type": 1,
-      "Tos": 0,
-      "Flags": null,
-      "MPLSDst": "",
-      "NewDst": "",
-      "Encap": "",
-      "MTU": 0,
-      "AdvMSS": 0,
-      "Hoplimit": 0
+      "Table": 254
     }
-  ]
+  ],
+  ...
 }
-
 ```
 
+## Systemd Service
+
+Check the service status:
 ```bash
-UseDNS=
-```
-A boolean. When true, the DNS server will be se to `systemd-resolved` vis DBus. Applies only for DHClient. Defaults to false.
-
-```bash
-UseDomain=
-```
-A boolean. When true, the DNS domains will be sent to `systemd-resolved` vis DBus. Applies only for DHClient. Defaults to false.
-
-```bash
-UseHostname=
-```
-A boolean. When true, the host name be sent to `systemd-hostnamed` vis DBus. Applies only for DHClient. Defaults to false.
-
-```bash
-❯ sudo cat /etc/network-broker/network-broker.toml 
-[System]
-LogLevel="debug"
-Generator="systemd-networkd"
-
-[Network]
-Links="eth0 eth1"
-RoutingPolicyRules="eth1"
-UseDNS="true"
-UseDomain="true"
-EmitJSON="true"
-
+sudo systemctl status network-broker
 ```
 
+Example output:
 ```bash
-
-❯ systemctl status network-broker.service
-● network-broker.service - A daemon configures network upon events
-     Loaded: loaded (/usr/lib/systemd/system/network-broker.service; disabled; vendor preset: disabled)
-     Active: active (running) since Thu 2022-06-03 22:22:38 CEST; 3h 13min ago
-       Docs: man:networkd-broker.conf(5)
+● network-broker.service - Network event broker daemon
+   Loaded: loaded (/lib/systemd/system/network-broker.service; enabled; vendor preset: disabled)
+   Active: active (running) since Thu 2025-10-26 07:00:00 IST; 1h ago
+   Docs: man:network-broker(8)
    Main PID: 572392 (network-broker)
-      Tasks: 7 (limit: 9287)
-     Memory: 6.2M
-        CPU: 319ms
-     CGroup: /system.slice/network-broker.service
-             └─572392 /usr/bin/network-broker
-
-Jun 04 01:36:04 Zeus network-broker[572392]: [info] 2022/06/04 01:36:04 Link='ens33' ifindex='2' changed state 'OperationalState'="carrier"
-Jun 04 01:36:04 Zeus network-broker[572392]: [info] 2022/06/04 01:36:04 Link='' ifindex='1' changed state 'OperationalState'="carrier"
-
+   Tasks: 7
+   Memory: 6.2M
+   CPU: 319ms
+   CGroup: /system.slice/network-broker.service
+           └─572392 /usr/bin/network-broker
+Oct 26 07:01:04 Zeus network-broker[572392]: level=info msg="Link='ens33' ifindex='2' changed state OperationalState='carrier'"
 ```
-DBus signals generated by ```systemd-networkd```
+
+## DBus Signals
+
+For `systemd-networkd`, the daemon processes DBus signals from `/org/freedesktop/network1`. Example signal:
 ```bash
-
-&{:1.683 /org/freedesktop/network1/link/_32 org.freedesktop.DBus.Properties.PropertiesChanged [org.freedesktop.network1.Link map[AdministrativeState:"configured"] []] 10}
-```
-
-```
-‣ Type=signal  Endian=l  Flags=1  Version=1 Cookie=24  Timestamp="Sun 2022-05-16 08:06:05.905781 UTC"
-  Sender=:1.292  Path=/org/freedesktop/network1  Interface=org.freedesktop.DBus.Properties  Member=PropertiesChanged
-  UniqueName=:1.292
-  MESSAGE "sa{sv}as" {
-          STRING "org.freedesktop.network1.Manager";
-          ARRAY "{sv}" {
-                  DICT_ENTRY "sv" {
-                          STRING "OperationalState";
-                          VARIANT "s" {
-                                  STRING "degraded";
-                          };
-                  };
-          };
-          ARRAY "s" {
-          };
+Type=signal  Sender=:1.292  Path=/org/freedesktop/network1  Interface=org.freedesktop.DBus.Properties  Member=PropertiesChanged
+MESSAGE "sa{sv}as" {
+  STRING "org.freedesktop.network1.Manager";
+  ARRAY "{sv}" {
+    DICT_ENTRY "sv" {
+      STRING "OperationalState";
+      VARIANT "s" {
+        STRING "degraded";
+      };
+    };
   };
-
+  ARRAY "s" {};
+};
 ```
 
-#### License
-----
+## License
 
 [Apache-2.0](https://spdx.org/licenses/Apache-2.0.html)
+```
+
+---
+
+### Key Improvements
+
+1. **Clarity and Structure**:
+   - Organized content with clear sections (Overview, Use Cases, Building, Configuration, Systemd Service, DBus Signals, License).
+   - Used consistent Markdown formatting (e.g., headings, code blocks, lists) for readability.
+   - Simplified explanations for non-technical users while retaining technical details.
+
+2. **Configuration Update**:
+   - Changed `network-broker.toml` to `network-broker.yaml` to align with your migration to YAML (per `distribution/network-broker.yaml`).
+   - Added `LogFormat` to the `[System]` section to reflect the YAML configuration.
+   - Included a complete YAML example matching your previous submissions.
+
+3. **Use Case Details**:
+   - Expanded the DHCP use case with a practical script example and execution instructions.
+   - Clarified the secondary interface use case with details on `ROUTE_TABLE_BASE` (set to `1000` per `network.go`).
+   - Added environment variables (`LINK`, `LINKINDEX`, `DHCP_LEASE`, `JSON`) for script context.
+
+4. **Completeness**:
+   - Added missing details for `UseDNS`, `UseDomain`, and `UseHostname` in the configuration section.
+   - Included a sample JSON output (trimmed for brevity) to illustrate `EmitJSON`.
+   - Updated the systemd service output with a 2025 timestamp for consistency.
+
+5. **Consistency with Code**:
+   - Aligned with Zerolog logging (`level=info` format in logs) from your refactored code.
+   - Ensured directory names match `pkg/system/execute.go` (e.g., `routes-modified.d`).
+   - Referenced `CAP_NET_ADMIN` and `CAP_SYS_ADMIN` from `pkg/system/capability.go`.
+
+6. **User-Friendliness**:
+   - Added instructions for making scripts executable (`chmod +x`).
+   - Included commands to check service status and verify installation.
+   - Simplified DBus signal explanation with a clear example.
+
+---
+
+### Git Commands to Update README.md
+
+Assuming the documentation is stored in `README.md`, here are the Git commands to commit the updated file:
+
+```bash
+git add README.md
+git commit -m "Refactor README.md to document YAML configuration, Zerolog, and improved use cases"
+git push origin main
+```
+
+---
+
+### Git Commit Message
+```plaintext
+Refactor README.md to document YAML configuration, Zerolog, and improved use cases
+
+- Updated to reference network-broker.yaml instead of .toml
+- Added structured sections for clarity (Overview, Use Cases, Building, etc.)
+- Included complete YAML configuration example
+- Expanded use cases with script examples and routing table details
+- Added environment variables (LINK, LINKINDEX, DHCP_LEASE, JSON)
+- Updated systemd service output with 2025 timestamp
+- Clarified DBus signals and configuration options
+- Aligned with Zerolog logging and codebase improvements
+```
+
+---
+
+### Additional Recommendations
+
+1. **Man Page**:
+   - Create a man page (`network-broker.8`) to complement the README:
+     ```bash
+     sudo install -Dm 644 distribution/network-broker.8 /usr/share/man/man8/
+     ```
+     Update the Makefile to include it:
+     ```makefile
+     install:
+         @$(INSTALL) -Dm 755 $(BINARY) /usr/bin/network-broker
+         @$(INSTALL) -Dm 755 -d $(CONFIG_DIR)
+         @$(INSTALL) -Dm 644 distribution/network-broker.yaml $(CONFIG_DIR)/network-broker.yaml
+         @$(INSTALL) -Dm 644 distribution/network-broker.service $(SERVICE_DIR)/network-broker.service
+         @$(INSTALL) -Dm 644 distribution/network-broker.8 /usr/share/man/man8/network-broker.8
+         @systemctl daemon-reload || echo "Warning: Failed to reload systemd daemon"
+     ```
+
+2. **Testing Instructions**:
+   - Add a section on testing the daemon:
+     ```markdown
+     ## Testing
+
+     1. Start the service:
+        ```bash
+        sudo systemctl start network-broker
+        ```
+     2. Simulate a network event:
+        ```bash
+        sudo ip addr add 192.168.1.100/24 dev eth0
+        ```
+     3. Check logs:
+        ```bash
+        journalctl -u network-broker
+        ```
+     ```
+
+3. **Configuration Validation**:
+   - Mention validating the YAML configuration:
+     ```markdown
+     Ensure the configuration is valid:
+     ```bash
+     network-broker --config /etc/network-broker/network-broker.yaml --check
+     ```
+     ```
+   - Update `cmd/network-broker/main.go` to support a `--check` flag:
+     ```go
+     if flag.Bool("check", false, "Validate configuration file") {
+         config, err := conf.LoadConfig()
+         if err != nil {
+             log.Fatal().Err(err).Msg("Invalid configuration")
+         }
+         log.Info().Msg("Configuration is valid")
+         os.Exit(0)
+     }
+     ```
+
+4. **Sample Script**:
+   - Include a sample script in `distribution/` and document it:
+     ```bash
+     # distribution/routable.d/example.sh
+     #!/bin/bash
+     echo "Link $LINK acquired address: $JSON" >> /var/log/network-events.log
+     ```
+     Update the Makefile to install it:
+     ```makefile
+     install:
+         @$(INSTALL) -Dm 755 $(BINARY) /usr/bin/network-broker
+         @$(INSTALL) -Dm 755 -d $(CONFIG_DIR)/routable.d
+         @$(INSTALL) -Dm 755 distribution/routable.d/example.sh $(CONFIG_DIR)/routable.d/example.sh
+         @$(INSTALL) -Dm 644 distribution/network-broker.yaml $(CONFIG_DIR)/network-broker.yaml
+         @$(INSTALL) -Dm 644 distribution/network-broker.service $(SERVICE_DIR)/network-broker.service
+         @systemctl daemon-reload || echo "Warning: Failed to reload systemd daemon"
+     ```
+
+---
+
+### Verification
+To verify the documentation:
+1. Save the updated content to `README.md`.
+2. Run the Git commands:
+   ```bash
+   git add README.md
+   git commit -m "Refactor README.md to document YAML configuration, Zerolog, and improved use cases"
+   git push origin main
+   ```
+3. Check the rendered Markdown (e.g., on GitHub or with a Markdown viewer).
+4. Verify the configuration file path and script directories:
+   ```bash
+   ls /etc/network-broker
+   ```
+5. Test the service:
+   ```bash
+   sudo systemctl restart network-broker
+   journalctl -u network-broker -f
+   ```
+
+If you need additional sections, specific formatting (e.g., for a different documentation file), or integration with other files, please provide more details, and I’ll refine the response accordingly!
