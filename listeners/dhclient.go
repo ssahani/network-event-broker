@@ -4,16 +4,18 @@
 package listeners
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
-	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/fsnotify/fsnotify"
-	log "github.com/sirupsen/logrus"
+	"github.com/rs/zerolog/log"
 	"golang.org/x/sys/unix"
 
 	"github.com/vmware/network-event-broker/pkg/bus"
@@ -23,179 +25,268 @@ import (
 	"github.com/vmware/network-event-broker/pkg/system"
 )
 
-func setDnsServer(dnsServers []net.IP, index int) error {
-	linkDns := make([]bus.DnsServer, len(dnsServers))
-	for i, s := range dnsServers {
-		linkDns[i] = bus.DnsServer{
-			Family:  unix.AF_INET,
-			Address: []byte(s.To4()),
+// setDNSServer configures DNS servers for a network interface.
+func setDNSServer(dnsServers []net.IP, index int) error {
+	if len(dnsServers) == 0 {
+		log.Debug().Int("ifindex", index).Msg("No DNS servers to configure")
+		return nil
+	}
+
+	linkDNS := make([]bus.DnsServer, 0, len(dnsServers))
+	for _, ip := range dnsServers {
+		if ip == nil {
+			log.Warn().Int("ifindex", index).Msg("Skipping invalid DNS IP")
+			continue
 		}
+		family := unix.AF_INET
+		addr := ip.To4()
+		if addr == nil {
+			family = unix.AF_INET6
+			addr = ip.To16()
+		}
+		if addr == nil {
+			log.Warn().Int("ifindex", index).Str("ip", ip.String()).Msg("Skipping invalid DNS IP")
+			continue
+		}
+		linkDNS = append(linkDNS, bus.DnsServer{
+			Family:  family,
+			Address: addr,
+		})
 	}
 
-	if err := bus.SetResolveDNS(linkDns, index); err != nil {
-		log.Warnln(err)
+	if len(linkDNS) == 0 {
+		log.Warn().Int("ifindex", index).Msg("No valid DNS servers after filtering")
+		return nil
 	}
 
+	if err := bus.SetResolveDNS(linkDNS, index); err != nil {
+		log.Warn().Int("ifindex", index).Err(err).Msg("Failed to set DNS servers")
+		return fmt.Errorf("failed to set DNS servers for ifindex %d: %w", index, err)
+	}
+
+	log.Debug().Int("ifindex", index).Int("count", len(linkDNS)).Msg("Successfully set DNS servers")
 	return nil
 }
 
-func setDnsDomain(dnsDomains []string, index int) error {
-	linkDomains := make([]bus.Domain, len(dnsDomains))
-	for i, domain := range dnsDomains {
-		linkDomains[i] = bus.Domain{
-			Domain: domain,
-			Set:    true,
+// setDNSDomain configures DNS domains for a network interface.
+func setDNSDomain(dnsDomains []string, index int) error {
+	if len(dnsDomains) == 0 {
+		log.Debug().Int("ifindex", index).Msg("No DNS domains to configure")
+		return nil
+	}
+
+	linkDomains := make([]bus.Domain, 0, len(dnsDomains))
+	for _, domain := range dnsDomains {
+		if domain == "" {
+			log.Warn().Int("ifindex", index).Msg("Skipping empty DNS domain")
+			continue
 		}
+		linkDomains = append(linkDomains, bus.Domain{
+			Domain:  domain,
+			Routing: true, // Renamed from Set to Routing for clarity (consistent with bus package).
+		})
+	}
+
+	if len(linkDomains) == 0 {
+		log.Warn().Int("ifindex", index).Msg("No valid DNS domains after filtering")
+		return nil
 	}
 
 	if err := bus.SetResolveDomain(linkDomains, index); err != nil {
-		log.Warnln(err)
+		log.Warn().Int("ifindex", index).Err(err).Msg("Failed to set DNS domains")
+		return fmt.Errorf("failed to set DNS domains for ifindex %d: %w", index, err)
 	}
 
+	log.Debug().Int("ifindex", index).Int("count", len(linkDomains)).Msg("Successfully set DNS domains")
 	return nil
 }
 
-func executeDHClientLinkStateScripts(n *network.Network, link string, strIndex string, dns string, domain string, domainSearch string, lease string, c *conf.Config) error {
-	scripts, err := system.ReadAllScriptInConfDir(path.Join(conf.ConfPath, "routable.d"))
+// executeDHClientLinkStateScripts runs scripts in the routable.d directory for a DHCP lease.
+func executeDHClientLinkStateScripts(n *network.Network, link, strIndex, dns, domain, domainSearch, lease string, cfg *conf.Config) error {
+	if link == "" || strIndex == "" || cfg == nil {
+		return fmt.Errorf("invalid input: link=%q, strIndex=%q, cfg=%v", link, strIndex, cfg)
+	}
+
+	scriptDir := filepath.Join(conf.ConfPath, "routable.d")
+	scripts, err := system.ReadAllScriptInConfDir(scriptDir)
 	if err != nil {
-		log.Errorf("Failed to read script dir: %+v", err)
-		return err
+		log.Error().Err(err).Str("dir", scriptDir).Msg("Failed to read script directory")
+		return fmt.Errorf("failed to read script directory %s: %w", scriptDir, err)
 	}
 
-	var jsonData string
-	if c.Network.EmitJSON {
-		m, err := acquireLink(link)
+	if len(scripts) == 0 {
+		log.Debug().Str("dir", scriptDir).Msg("No scripts found in directory")
+		return nil
+	}
+
+	// Prepare environment variables.
+	env := append(os.Environ(),
+		"LINK="+link,
+		"LINKINDEX="+strIndex,
+		"DNS="+dns,
+		"DOMAIN="+domain,
+		"DHCP_LEASE="+lease,
+	)
+	if domainSearch != "" {
+		env = append(env, "DOMAINSEARCH="+domainSearch)
+	}
+
+	// Add JSON data if enabled.
+	if cfg.Network.EmitJSON {
+		linkData, err := acquireLink(link)
 		if err == nil {
-			m.DNS = []string{dns}
-			m.Domains = []string{domain}
-			m.DomainSearch = []string{domainSearch}
-
-			j, _ := json.Marshal(m)
-			jsonData = "JSON=" + string(j)
-
-			log.Debugf("JSON: %+v", jsonData)
+			linkData.DNS = strings.Split(dns, ",")
+			linkData.Domains = strings.Split(domain, ",")
+			linkData.DomainSearch = strings.Split(domainSearch, ",")
+			if jsonBytes, err := json.Marshal(linkData); err == nil {
+				jsonStr := "JSON=" + string(jsonBytes)
+				env = append(env, jsonStr)
+				log.Debug().Str("link", link).Str("json", jsonStr).Msg("Generated JSON data")
+			} else {
+				log.Warn().Str("link", link).Err(err).Msg("Failed to marshal link data")
+			}
+		} else {
+			log.Warn().Str("link", link).Err(err).Msg("Failed to acquire link data for JSON")
 		}
 	}
 
-	link = "LINK=" + link
-	strIndex = "LINKINDEX=" + strIndex
-	dns = "DNS=" + dns
-	domain = "DOMAIN=" + domain
+	// Execute scripts with timeout.
+	for _, script := range scripts {
+		scriptPath := filepath.Join(scriptDir, script)
+		log.Debug().Str("script", scriptPath).Str("link", link).Msg("Executing script")
 
-	for _, s := range scripts {
-		script := path.Join(conf.ConfPath, "routable.d", s)
+		ctx, cancel := context.WithTimeout(context.Background(), defaultRequestTimeout)
+		defer cancel()
 
-		log.Debugf("Executing script='%s' for '%s' lease=%s", script, link, lease)
-
-		cmd := exec.Command(script)
-		cmd.Env = append(os.Environ(),
-			link,
-			link,
-			strIndex,
-			lease,
-			dns,
-			domain,
-		)
-
-		if c.Network.EmitJSON {
-			cmd.Env = append(cmd.Env, jsonData)
-		}
+		cmd := exec.CommandContext(ctx, scriptPath)
+		cmd.Env = env
 
 		if err := cmd.Run(); err != nil {
-			log.Errorf("Failed to execute script='%s': %w", script, err)
+			log.Error().Str("script", scriptPath).Err(err).Msg("Failed to execute script")
 			continue
 		}
 
-		log.Debugf("Successfully executed script='%s' for link='%s'", script, link)
+		log.Debug().Str("script", scriptPath).Str("link", link).Msg("Successfully executed script")
 	}
 
 	return nil
 }
 
-func TaskDHClient(n *network.Network, c *conf.Config) error {
-	leases, err := parser.ParseDHClientLease()
-	if err != nil {
-		log.Debugf("Failed to parse DHClient lease file '%s': %w", conf.DHClientLeaseFile, err)
+// TaskDHClient processes DHCP client leases and applies configurations.
+func TaskDHClient(n *network.Network, cfg *conf.Config) error {
+	if n == nil || cfg == nil {
+		return fmt.Errorf("network or config cannot be nil")
 	}
 
-	for i, lease := range leases {
-		_, ok := n.LinksByName[i]
+	leases, err := parser.ParseDHClientLease()
+	if err != nil {
+		log.Warn().Str("file", conf.DHClientLeaseFile).Err(err).Msg("Failed to parse DHClient lease file")
+		return nil // Continue processing to avoid blocking other tasks.
+	}
+
+	for link, lease := range leases {
+		index, ok := n.LinksByName[link]
 		if !ok {
+			log.Debug().Str("link", link).Msg("Link not found in network links")
 			continue
 		}
 
-		idx := n.LinksByName[i]
-		if c.Network.Links != "" {
-			if !strings.Contains(c.Network.Links, n.LinksByIndex[idx]) {
-				continue
-			}
+		if cfg.Network.Links != "" && !strings.Contains(cfg.Network.Links, link) {
+			log.Debug().Str("link", link).Msg("Link not in configured links")
+			continue
 		}
 
-		strIndex := strconv.Itoa(idx)
-
+		strIndex := strconv.Itoa(index)
 		dns := strings.Join(lease.Dns, ",")
 		domain := strings.Join(lease.Domain, ",")
 		domainSearch := strings.Join(lease.DomainSearch, ",")
-		strings.Join(lease.Domain, ",")
-		dhcpLease := "DHCP_LEASE=" + "ADDRESS=" + lease.Address + ",DNS=" + strings.Join(lease.Dns, ",") + ",ROUTER=" + lease.Routers + ",SUBNETMASK=" + lease.SubnetMask + ",DNS=" + dns + ",DOMAIN=" + domain
+		dhcpLease := fmt.Sprintf("ADDRESS=%s,DNS=%s,ROUTER=%s,SUBNETMASK=%s,DOMAIN=%s",
+			lease.Address, dns, lease.Routers, lease.SubnetMask, domain)
 
-		executeDHClientLinkStateScripts(n, i, strIndex, dns, domain, domainSearch, dhcpLease, c)
+		log.Debug().Str("link", link).Int("ifindex", index).Msg("Processing DHCP lease")
 
-		if c.Network.UseHostname {
+		if err := executeDHClientLinkStateScripts(n, link, strIndex, dns, domain, domainSearch, dhcpLease, cfg); err != nil {
+			log.Warn().Str("link", link).Int("ifindex", index).Err(err).Msg("Failed to execute link state scripts")
+		}
+
+		if cfg.Network.UseHostname && lease.Hostname != "" {
 			if err := bus.SetHostname(lease.Hostname); err != nil {
-				log.Warnln("Failed to set hostname='%s': %+w", lease.Hostname, err)
+				log.Warn().Str("hostname", lease.Hostname).Int("ifindex", index).Err(err).Msg("Failed to set hostname")
+			} else {
+				log.Debug().Str("hostname", lease.Hostname).Int("ifindex", index).Msg("Successfully set hostname")
 			}
 		}
 
-		if c.Network.UseDNS && len(lease.Dns) > 0 {
-			var dnsServers []net.IP
-
+		if cfg.Network.UseDNS && len(lease.Dns) > 0 {
+			dnsServers := make([]net.IP, 0, len(lease.Dns))
 			for _, d := range lease.Dns {
-				v, _ := parser.ParseIP(strings.TrimSpace(d))
-				dnsServers = append(dnsServers, v)
+				if ip, err := parser.ParseIP(strings.TrimSpace(d)); err == nil && ip != nil {
+					dnsServers = append(dnsServers, ip)
+				} else {
+					log.Warn().Str("dns", d).Int("ifindex", index).Err(err).Msg("Invalid DNS IP")
+				}
 			}
-			setDnsServer(dnsServers, idx)
+			if err := setDNSServer(dnsServers, index); err != nil {
+				log.Warn().Int("ifindex", index).Err(err).Msg("Failed to configure DNS servers")
+			}
 		}
 
-		if c.Network.UseDomain && len(lease.Domain) > 0 {
-			setDnsDomain(lease.Domain, idx)
+		if cfg.Network.UseDomain && len(lease.Domain) > 0 {
+			if err := setDNSDomain(lease.Domain, index); err != nil {
+				log.Warn().Int("ifindex", index).Err(err).Msg("Failed to configure DNS domains")
+			}
 		}
 	}
 
 	return nil
 }
 
-func WatchDHClient(n *network.Network, c *conf.Config, finished chan bool) {
+// WatchDHClient monitors the DHClient lease file for changes and processes updates.
+func WatchDHClient(n *network.Network, cfg *conf.Config, finished chan bool) {
+	if n == nil || cfg == nil {
+		log.Fatal().Msg("Network or config cannot be nil")
+	}
+
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		log.Errorf("Failed to watch DHClient lease: %w", err)
+		log.Fatal().Err(err).Msg("Failed to create file watcher")
 	}
-	defer watcher.Close()
-
-	log.Infoln("Listening to DHClient events")
-
-	// Try once incase dhclient already have the leases
-	TaskDHClient(n, c)
-
-	done := make(chan bool)
-
-	go func() {
-		for {
-			select {
-			case event := <-watcher.Events:
-				log.Debugf("DHClient Received event: %s", event.Op.String())
-
-				TaskDHClient(n, c)
-
-			case err := <-watcher.Errors:
-				log.Errorln(err)
-			}
+	defer func() {
+		if err := watcher.Close(); err != nil {
+			log.Warn().Err(err).Msg("Failed to close file watcher")
 		}
+		finished <- true
 	}()
 
-	if err := watcher.Add(conf.DHClientLeaseFile); err != nil {
-		log.Errorf("Failed to watch DHClient lease file: %w", err)
+	log.Info().Str("file", conf.DHClientLeaseFile).Msg("Listening to DHClient lease file events")
+
+	// Process leases initially in case they already exist.
+	if err := TaskDHClient(n, cfg); err != nil {
+		log.Warn().Err(err).Msg("Initial DHClient lease processing failed")
 	}
 
-	<-done
+	if err := watcher.Add(conf.DHClientLeaseFile); err != nil {
+		log.Error().Err(err).Str("file", conf.DHClientLeaseFile).Msg("Failed to watch DHClient lease file")
+		return
+	}
+
+	for {
+		select {
+		case event, ok := <-watcher.Events:
+			if !ok {
+				log.Warn().Msg("File watcher channel closed")
+				return
+			}
+			log.Debug().Str("file", event.Name).Str("op", event.Op.String()).Msg("Received file event")
+			if err := TaskDHClient(n, cfg); err != nil {
+				log.Warn().Err(err).Msg("Failed to process DHClient lease event")
+			}
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				log.Warn().Msg("File watcher error channel closed")
+				return
+			}
+			log.Error().Err(err).Msg("File watcher error")
+		}
+	}
 }
