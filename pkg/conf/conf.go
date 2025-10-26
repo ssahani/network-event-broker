@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2023 VMware, Inc.
 
 package conf
 
@@ -9,9 +8,15 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/sirupsen/logrus"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"github.com/spf13/viper"
 )
+
+func init() {
+	// Initialize Zerolog global logger with JSON output (console for dev).
+	log.Logger = log.With().Timestamp().Logger()
+}
 
 // Constants for configuration paths and defaults.
 const (
@@ -53,7 +58,8 @@ type Config struct {
 // Validate validates the configuration.
 func (c *Config) Validate() error {
 	if c.System.LogLevel != "" {
-		if _, err := logrus.ParseLevel(c.System.LogLevel); err != nil {
+		_, err := zerolog.ParseLevel(c.System.LogLevel)
+		if err != nil {
 			return fmt.Errorf("invalid log level: %s", c.System.LogLevel)
 		}
 	}
@@ -90,13 +96,13 @@ func SetLogLevel(level string) error {
 		return errors.New("log level cannot be empty")
 	}
 
-	lvl, err := logrus.ParseLevel(level)
+	lvl, err := zerolog.ParseLevel(level)
 	if err != nil {
-		logrus.Warnf("Invalid log level %q, falling back to %q", level, DefaultLogLevel)
+		log.Warn().Str("level", level).Msgf("Invalid log level, falling back to %q", DefaultLogLevel)
 		return fmt.Errorf("invalid log level: %w", err)
 	}
 
-	logrus.SetLevel(lvl)
+	zerolog.SetGlobalLevel(lvl)
 	return nil
 }
 
@@ -106,17 +112,11 @@ func SetLogFormat(format string) error {
 		return errors.New("log format cannot be empty")
 	}
 
-	switch format {
-	case "json":
-		logrus.SetFormatter(&logrus.JSONFormatter{
-			DisableTimestamp: true,
-		})
-	case "text":
-		logrus.SetFormatter(&logrus.TextFormatter{
-			DisableTimestamp: true,
-		})
-	default:
-		logrus.Warnf("Invalid log format %q, falling back to %q", format, DefaultLogFormat)
+	// Zerolog is JSON by default; for text, switch to ConsoleWriter.
+	if format == "text" {
+		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stdout})
+	} else if format != "json" {
+		log.Warn().Str("format", format).Msgf("Invalid log format, falling back to %q", DefaultLogFormat)
 		return fmt.Errorf("invalid log format: %s", format)
 	}
 	return nil
@@ -135,9 +135,9 @@ func Parse() (*Config, error) {
 	// Read configuration file.
 	if err := viper.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
-			logrus.Warn("Configuration file not found, using defaults")
+			log.Warn().Msg("Configuration file not found, using defaults")
 		} else {
-			logrus.Errorf("Failed to read configuration file %s/%s.toml: %v", ConfPath, ConfFile, err)
+			log.Error().Err(err).Str("file", ConfPath+"/"+ConfFile+".toml").Msg("Failed to read configuration file")
 			return nil, fmt.Errorf("failed to read configuration: %w", err)
 		}
 	}
@@ -145,13 +145,13 @@ func Parse() (*Config, error) {
 	// Unmarshal configuration into struct.
 	cfg := &Config{}
 	if err := viper.Unmarshal(cfg); err != nil {
-		logrus.Errorf("Failed to parse configuration file %s/%s.toml: %v", ConfPath, ConfFile, err)
+		log.Error().Err(err).Str("file", ConfPath+"/"+ConfFile+".toml").Msg("Failed to parse configuration file")
 		return nil, fmt.Errorf("failed to parse configuration: %w", err)
 	}
 
 	// Validate configuration.
 	if err := cfg.Validate(); err != nil {
-		logrus.Errorf("Invalid configuration: %v", err)
+		log.Error().Err(err).Msg("Invalid configuration")
 		return nil, err
 	}
 
@@ -161,10 +161,10 @@ func Parse() (*Config, error) {
 		logLevel = cfg.System.LogLevel
 	}
 	if err := SetLogLevel(logLevel); err != nil {
-		logrus.Warnf("Failed to set log level %q, using default %q", logLevel, DefaultLogLevel)
+		log.Warn().Str("level", logLevel).Msgf("Failed to set log level, using default %q", DefaultLogLevel)
 		cfg.System.LogLevel = DefaultLogLevel
 		if err := SetLogLevel(DefaultLogLevel); err != nil {
-			logrus.Fatalf("Failed to set default log level %q: %v", DefaultLogLevel, err)
+			log.Fatal().Str("level", DefaultLogLevel).Err(err).Msg("Failed to set default log level")
 		}
 	}
 
@@ -173,28 +173,28 @@ func Parse() (*Config, error) {
 		logFormat = cfg.System.LogFormat
 	}
 	if err := SetLogFormat(logFormat); err != nil {
-		logrus.Warnf("Failed to set log format %q, using default %q", logFormat, DefaultLogFormat)
+		log.Warn().Str("format", logFormat).Msgf("Failed to set log format, using default %q", DefaultLogFormat)
 		cfg.System.LogFormat = DefaultLogFormat
 		if err := SetLogFormat(DefaultLogFormat); err != nil {
-			logrus.Fatalf("Failed to set default log format %q: %v", DefaultLogFormat, err)
+			log.Fatal().Str("format", DefaultLogFormat).Err(err).Msg("Failed to set default log format")
 		}
 	}
 
 	// Log configuration details.
-	logrus.Debugf("Log level set to %q", logrus.GetLevel().String())
+	log.Debug().Str("level", zerolog.GlobalLevel().String()).Msg("Log level set")
 	if cfg.System.Generator != "" {
-		logrus.Infof("Generator: %s", cfg.System.Generator)
+		log.Info().Str("generator", cfg.System.Generator).Msg("Generator")
 	}
 	if cfg.Network.Links != "" {
-		logrus.Infof("Links: %s", cfg.Network.Links)
+		log.Info().Str("links", cfg.Network.Links).Msg("Links")
 	}
 	if cfg.Network.RoutingPolicyRules != "" {
-		logrus.Infof("RoutingPolicyRules: %s", cfg.Network.RoutingPolicyRules)
+		log.Info().Str("rules", cfg.Network.RoutingPolicyRules).Msg("RoutingPolicyRules")
 	}
 
 	// Create event script directories.
 	if err := createEventScriptDirs(); err != nil {
-		logrus.Errorf("Failed to create event script directories: %v", err)
+		log.Error().Err(err).Msg("Failed to create event script directories")
 		return nil, fmt.Errorf("failed to create directories: %w", err)
 	}
 
